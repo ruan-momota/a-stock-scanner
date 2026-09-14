@@ -162,18 +162,17 @@ def test_update_appends_one_market_snapshot(tmp_path, monkeypatch):
         snapshots.append(1)
         return pd.DataFrame(
             {
-                "symbol": ["000001"],
-                "price": [11.0],
-                "open": [10.0],
-                "day_high": [12.0],
-                "day_low": [9.0],
-                "volume": [100.0],
-                "amount": [110000.0],
-                "turnover": [2.5],
+                "代码": ["sz000001"],
+                "今开": [10.0],
+                "最高": [12.0],
+                "最低": [9.0],
+                "最新价": [11.0],
+                "成交量": [10000.0],
+                "成交额": [110000.0],
             }
         )
 
-    monkeypatch.setattr(data_source, "get_realtime_quotes", snapshot)
+    monkeypatch.setattr(data_source.ak, "stock_zh_a_spot", snapshot)
     with database.connect() as connection:
         database.save_daily(connection, row("600000", day))
         database.save_daily(connection, row("000001", previous))
@@ -183,6 +182,8 @@ def test_update_appends_one_market_snapshot(tmp_path, monkeypatch):
 
     assert snapshots == [1]
     assert rows.date.dt.date.tolist() == [previous, day]
+    assert rows.iloc[-1].volume == 100.0
+    assert pd.isna(rows.iloc[-1].turnover)
     assert result == {
         "date": day.isoformat(),
         "saved": 1,

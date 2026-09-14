@@ -20,7 +20,7 @@ def main(argv=None):
         choices=["sina", "eastmoney"],
         help="初始化历史数据源；新数据库默认 sina，已有数据库沿用原来源",
     )
-    commands.add_parser("update", help="使用东财全市场快照追加最新日线")
+    commands.add_parser("update", help="使用新浪全市场快照追加最新日线")
     commands.add_parser("pool", help="生成最近收盘日低位股票池")
     scan = commands.add_parser("scan", help="盘中自动扫描，Ctrl+C停止")
     scan.add_argument("--once", action="store_true", help="只扫描一次")

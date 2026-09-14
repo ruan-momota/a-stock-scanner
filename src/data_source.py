@@ -20,7 +20,6 @@ QUOTE_COLUMNS = {
     "涨跌幅": "change_pct",
     "成交量": "volume",
     "成交额": "amount",
-    "今开": "open",
     "最高": "day_high",
     "最低": "day_low",
     "量比": "volume_ratio",
@@ -61,18 +60,7 @@ def request(function, **kwargs):
 
 def get_realtime_quotes() -> pd.DataFrame:
     raw = request(ak.stock_zh_a_spot_em)
-    required = {
-        "代码",
-        "名称",
-        "最新价",
-        "今开",
-        "最高",
-        "最低",
-        "成交量",
-        "成交额",
-        "量比",
-        "换手率",
-    }
+    required = {"代码", "名称", "最新价", "成交额", "量比", "最高", "最低", "换手率"}
     if raw.empty or not required.issubset(raw.columns):
         raise ValueError("实时行情为空或缺少关键字段，请稍后重试。")
     quotes = raw.rename(columns=QUOTE_COLUMNS).reindex(columns=QUOTE_COLUMNS.values())
@@ -171,18 +159,35 @@ def clean_daily(daily: pd.DataFrame) -> pd.DataFrame:
     daily["date"] = pd.to_datetime(daily["date"], errors="coerce")
     numeric = daily.columns.difference(["symbol", "date"])
     daily[numeric] = daily[numeric].apply(pd.to_numeric, errors="coerce")
-    daily = daily.replace([np.inf, -np.inf], np.nan).dropna(subset=["date", *numeric])
+    required = ["open", "high", "low", "close", "volume", "amount"]
+    daily = daily.replace([np.inf, -np.inf], np.nan).dropna(subset=["date", *required])
     valid = (daily[["open", "high", "low", "close"]] > 0).all(axis=1)
     valid &= daily["close"].between(daily["low"], daily["high"])
     valid &= daily["open"].between(daily["low"], daily["high"])
-    valid &= (daily[["volume", "amount", "turnover"]] >= 0).all(axis=1)
+    valid &= (daily[["volume", "amount"]] >= 0).all(axis=1)
+    valid &= daily["turnover"].isna() | (daily["turnover"] >= 0)
     return daily.loc[valid].drop_duplicates(["symbol", "date"]).sort_values("date")
 
 
 def get_daily_snapshot(day: date) -> pd.DataFrame:
-    daily = get_realtime_quotes().rename(
-        columns={"price": "close", "day_high": "high", "day_low": "low"}
+    raw = request(ak.stock_zh_a_spot)
+    required = {"代码", "今开", "最高", "最低", "最新价", "成交量", "成交额"}
+    if raw.empty or not required.issubset(raw.columns):
+        raise ValueError("新浪全市场快照为空或缺少关键字段，请稍后重试。")
+    daily = raw.rename(
+        columns={
+            "代码": "symbol",
+            "今开": "open",
+            "最高": "high",
+            "最低": "low",
+            "最新价": "close",
+            "成交量": "volume",
+            "成交额": "amount",
+        }
     )
+    daily["symbol"] = daily["symbol"].astype(str).str[-6:]
+    daily["volume"] = pd.to_numeric(daily["volume"], errors="coerce") / 100
+    daily["turnover"] = np.nan
     daily["date"] = pd.Timestamp(day)
     return clean_daily(daily)
 
@@ -206,7 +211,7 @@ def trading_days_through(day: date) -> list[date]:
 def update_history(
     connection, end: date, *, initialize: bool = False, source: str | None = None
 ) -> dict:
-    """初始化历史数据，或用东财全市场快照追加一个交易日。"""
+    """初始化历史数据，或用新浪全市场快照追加一个交易日。"""
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
     from src import database
