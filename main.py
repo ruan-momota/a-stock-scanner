@@ -16,7 +16,7 @@ def main(argv=None):
     commands = parser.add_subparsers(dest="command", required=True)
     for name, help_text in (
         ("init", "首次下载最近250个交易日日线"),
-        ("update", "刷新完整本地前复权日线"),
+        ("update", "增量更新本地前复权日线"),
     ):
         command = commands.add_parser(name, help=help_text)
         command.add_argument(

@@ -2,7 +2,7 @@
 
 import logging
 import time
-from datetime import date
+from datetime import date, timedelta
 from functools import lru_cache
 
 import akshare as ak
@@ -181,7 +181,7 @@ def trading_days_through(day: date) -> list[date]:
 def update_history(
     connection, end: date, *, initialize: bool = False, source: str | None = None
 ) -> dict:
-    """下载线程不访问数据库；更新时刷新完整本地前复权区间。"""
+    """下载线程不访问数据库；已有股票只下载最后日期之后的数据。"""
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
     from src import database
@@ -203,12 +203,11 @@ def update_history(
     logger.info("获取股票名单，历史数据源：%s", source)
     stocks = get_stock_list(source)
     days = trading_days_through(end)
-    start = days[max(0, len(days) - config.HISTORY_DAYS)]
+    initial_start = days[max(0, len(days) - config.HISTORY_DAYS)]
     ranges = connection.execute(
-        "SELECT symbol, min(date), max(date) FROM daily_prices GROUP BY symbol"
+        "SELECT symbol, max(date) FROM daily_prices GROUP BY symbol"
     ).fetchall()
-    earliest = {symbol: first for symbol, first, _ in ranges}
-    latest = {symbol: last for symbol, _, last in ranges}
+    latest = dict(ranges)
     symbols = [
         symbol
         for symbol in stocks.symbol
@@ -227,13 +226,16 @@ def update_history(
 
     def download(symbol):
         try:
-            history = get_daily_history(
-                symbol, earliest.get(symbol, start), end, source
+            download_start = (
+                latest[symbol] + timedelta(days=1)
+                if symbol in latest
+                else initial_start
             )
+            history = get_daily_history(symbol, download_start, end, source)
         finally:
             if source == "sina":
                 time.sleep(1)
-        if symbol not in earliest:
+        if symbol not in latest:
             history = history.tail(config.HISTORY_DAYS)
         if history.empty:
             raise ValueError("未返回有效日线")

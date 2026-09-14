@@ -130,7 +130,9 @@ def test_source_is_persisted_reused_and_cannot_mix_prices(tmp_path, monkeypatch)
     assert sources == ["sina", "sina"]
 
 
-def test_update_skips_current_and_downloads_lagging(tmp_path, monkeypatch):
+def test_update_skips_current_and_incrementally_downloads_lagging(
+    tmp_path, monkeypatch
+):
     monkeypatch.setattr(config, "DB_PATH", tmp_path / "market.duckdb")
     day = date(2026, 9, 11)
     previous = day - timedelta(days=1)
@@ -171,7 +173,7 @@ def test_update_skips_current_and_downloads_lagging(tmp_path, monkeypatch):
         database.save_state(history_source="sina")
         result = data_source.update_history(connection, day)
 
-    assert calls == [("000001", previous, day, "sina")]
+    assert calls == [("000001", day, day, "sina")]
     assert result == {
         "date": day.isoformat(),
         "saved": 1,
