@@ -45,12 +45,13 @@ def request(function, **kwargs):
     for attempt in range(config.REQUEST_RETRIES + 1):
         try:
             return function(**kwargs)
-        except Exception:
+        except Exception as exc:
             if attempt == config.REQUEST_RETRIES:
                 raise
             logger.warning(
-                "%s 请求失败，重试 %s/%s",
+                "%s 请求失败（%s），重试 %s/%s",
                 function.__name__,
+                exc,
                 attempt + 1,
                 config.REQUEST_RETRIES,
             )
@@ -87,20 +88,65 @@ def eligible_stocks(quotes: pd.DataFrame) -> pd.DataFrame:
     return stocks
 
 
-def get_stock_list() -> pd.DataFrame:
-    return eligible_stocks(get_realtime_quotes())[["symbol", "name", "market"]]
-
-
-def get_daily_history(symbol: str, start: date, end: date) -> pd.DataFrame:
-    raw = request(
-        ak.stock_zh_a_hist,
-        symbol=symbol,
-        period="daily",
-        adjust="qfq",
-        start_date=start.strftime("%Y%m%d"),
-        end_date=end.strftime("%Y%m%d"),
-        timeout=config.REQUEST_TIMEOUT_SECONDS,
+def get_stock_list(source: str = "eastmoney") -> pd.DataFrame:
+    if source == "sina":
+        frames = []
+        for function, board, code_column, name_column in (
+            (ak.stock_info_sh_name_code, "主板A股", "证券代码", "证券简称"),
+            (ak.stock_info_sh_name_code, "科创板", "证券代码", "证券简称"),
+            (ak.stock_info_sz_name_code, "A股列表", "A股代码", "A股简称"),
+        ):
+            raw = request(function, symbol=board)
+            if raw.empty or not {code_column, name_column}.issubset(raw.columns):
+                raise ValueError(f"交易所股票名单为空或缺少代码、名称：{board}")
+            frames.append(
+                raw[[code_column, name_column]].rename(
+                    columns={code_column: "symbol", name_column: "name"}
+                )
+            )
+        stocks = pd.concat(frames, ignore_index=True)
+        stocks["symbol"] = stocks["symbol"].astype(str).str.zfill(6)
+    elif source == "eastmoney":
+        try:
+            stocks = get_realtime_quotes()
+        except Exception as exc:
+            raise RuntimeError(
+                "东方财富股票名单获取失败，尚未开始下载日线。"
+                "可尝试 init --source sina 使用新浪初始化；盘中扫描仍依赖东方财富。"
+            ) from exc
+    else:
+        raise ValueError(f"未知历史数据源：{source}")
+    return eligible_stocks(stocks)[["symbol", "name", "market"]].drop_duplicates(
+        "symbol"
     )
+
+
+def get_daily_history(
+    symbol: str, start: date, end: date, source: str = "eastmoney"
+) -> pd.DataFrame:
+    dates = {"start_date": start.strftime("%Y%m%d"), "end_date": end.strftime("%Y%m%d")}
+    if source == "sina":
+        raw = request(
+            ak.stock_zh_a_daily,
+            symbol=("sh" if symbol.startswith("6") else "sz") + symbol,
+            adjust="qfq",
+            **dates,
+        ).copy()
+        if not raw.empty:
+            raw["symbol"] = symbol
+            raw["volume"] = pd.to_numeric(raw["volume"], errors="coerce") / 100
+            raw["turnover"] = pd.to_numeric(raw["turnover"], errors="coerce") * 100
+    elif source == "eastmoney":
+        raw = request(
+            ak.stock_zh_a_hist,
+            symbol=symbol,
+            period="daily",
+            adjust="qfq",
+            timeout=config.REQUEST_TIMEOUT_SECONDS,
+            **dates,
+        )
+    else:
+        raise ValueError(f"未知历史数据源：{source}")
     if raw.empty:
         return pd.DataFrame(columns=DAILY_COLUMNS.values())
     daily = raw.rename(columns=DAILY_COLUMNS)[list(DAILY_COLUMNS.values())].copy()
@@ -132,13 +178,30 @@ def trading_days_through(day: date) -> list[date]:
     return [item for item in days if item <= day]
 
 
-def update_history(connection, end: date, *, initialize: bool = False) -> dict:
+def update_history(
+    connection, end: date, *, initialize: bool = False, source: str | None = None
+) -> dict:
     """下载线程不访问数据库；更新时刷新完整本地前复权区间。"""
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
     from src import database
 
-    stocks = get_stock_list()
+    state = database.load_state()
+    previous_source = state.get("history_source", "eastmoney")
+    source = source or previous_source
+    if source not in ("eastmoney", "sina"):
+        raise ValueError(f"未知历史数据源：{source}")
+    if (
+        source != previous_source
+        and connection.execute("SELECT EXISTS(SELECT 1 FROM daily_prices)").fetchone()[
+            0
+        ]
+    ):
+        raise ValueError(
+            "数据库已有其他来源的日线，请使用独立数据目录，避免混合前复权口径。"
+        )
+    logger.info("获取股票名单，历史数据源：%s", source)
+    stocks = get_stock_list(source)
     days = trading_days_through(end)
     start = days[max(0, len(days) - config.HISTORY_DAYS)]
     earliest = dict(
@@ -146,19 +209,25 @@ def update_history(connection, end: date, *, initialize: bool = False) -> dict:
             "SELECT symbol, min(date) FROM daily_prices GROUP BY symbol"
         ).fetchall()
     )
-    database.save_state(stocks=stocks.to_dict("records"))
+    database.save_state(stocks=stocks.to_dict("records"), history_source=source)
     failures = {}
     saved = 0
 
     def download(symbol):
-        history = get_daily_history(symbol, earliest.get(symbol, start), end)
+        try:
+            history = get_daily_history(
+                symbol, earliest.get(symbol, start), end, source
+            )
+        finally:
+            if source == "sina":
+                time.sleep(1)
         if symbol not in earliest:
             history = history.tail(config.HISTORY_DAYS)
         if history.empty:
             raise ValueError("未返回有效日线")
         return history
 
-    workers = config.DOWNLOAD_WORKERS if initialize else 1
+    workers = config.DOWNLOAD_WORKERS if initialize and source == "eastmoney" else 1
     with ThreadPoolExecutor(max_workers=workers) as executor:
         futures = {
             executor.submit(download, symbol): symbol for symbol in stocks.symbol
