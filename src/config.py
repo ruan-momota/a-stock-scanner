@@ -1,0 +1,19 @@
+from pathlib import Path
+from zoneinfo import ZoneInfo
+
+ROOT = Path(__file__).resolve().parents[1]
+DB_PATH = ROOT / "data" / "market.duckdb"
+TIMEZONE = ZoneInfo("Asia/Shanghai")
+
+BOTTOM_POSITION_MAX = 0.30
+DRAWDOWN_MIN = -0.20
+DISTANCE_FROM_LOW_MAX = 0.15
+VOLUME_RATIO_MIN = 1.8
+MIN_AMOUNT = 50_000_000
+SCAN_INTERVAL_SECONDS = 60
+
+HISTORY_DAYS = 250
+DOWNLOAD_WORKERS = 8
+REQUEST_RETRIES = 2
+REQUEST_TIMEOUT_SECONDS = 15
+RETURN_DAYS = (5, 10, 20, 60)
