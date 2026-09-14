@@ -120,19 +120,17 @@ def test_source_is_persisted_reused_and_cannot_mix_prices(tmp_path, monkeypatch)
     assert main(["init", "--source", "sina"]) == 0
     assert main(["update"]) == 0
     assert database.load_state()["history_source"] == "sina"
-    assert sources == ["sina", "sina"]
+    assert sources == ["sina"]
     with database.connect() as connection:
         rows = database.load_daily(connection)
         assert len(rows) == 1 and rows.iloc[0].volume == 100.0
         with pytest.raises(ValueError, match="混合前复权"):
             data_source.update_history(connection, day, source="eastmoney")
     assert database.load_state()["history_source"] == "sina"
-    assert sources == ["sina", "sina"]
+    assert sources == ["sina"]
 
 
-def test_update_skips_current_and_incrementally_downloads_lagging(
-    tmp_path, monkeypatch
-):
+def test_update_appends_one_market_snapshot(tmp_path, monkeypatch):
     monkeypatch.setattr(config, "DB_PATH", tmp_path / "market.duckdb")
     day = date(2026, 9, 11)
     previous = day - timedelta(days=1)
@@ -142,10 +140,6 @@ def test_update_skips_current_and_incrementally_downloads_lagging(
             {"symbol": "000001", "name": "待更新", "market": "深市主板"},
         ]
     )
-    monkeypatch.setattr(data_source, "get_stock_list", lambda source: stocks)
-    monkeypatch.setattr(data_source, "get_trading_days", lambda: (previous, day))
-    monkeypatch.setattr(data_source.time, "sleep", lambda _: None)
-    calls = []
 
     def row(symbol, row_day):
         return pd.DataFrame(
@@ -162,18 +156,33 @@ def test_update_skips_current_and_incrementally_downloads_lagging(
             }
         )
 
-    def download(symbol, start, end, source):
-        calls.append((symbol, start, end, source))
-        return row(symbol, end)
+    snapshots = []
 
-    monkeypatch.setattr(data_source, "get_daily_history", download)
+    def snapshot():
+        snapshots.append(1)
+        return pd.DataFrame(
+            {
+                "symbol": ["000001"],
+                "price": [11.0],
+                "open": [10.0],
+                "day_high": [12.0],
+                "day_low": [9.0],
+                "volume": [100.0],
+                "amount": [110000.0],
+                "turnover": [2.5],
+            }
+        )
+
+    monkeypatch.setattr(data_source, "get_realtime_quotes", snapshot)
     with database.connect() as connection:
         database.save_daily(connection, row("600000", day))
         database.save_daily(connection, row("000001", previous))
-        database.save_state(history_source="sina")
+        database.save_state(history_source="sina", stocks=stocks.to_dict("records"))
         result = data_source.update_history(connection, day)
+        rows = database.load_daily(connection, "000001")
 
-    assert calls == [("000001", day, day, "sina")]
+    assert snapshots == [1]
+    assert rows.date.dt.date.tolist() == [previous, day]
     assert result == {
         "date": day.isoformat(),
         "saved": 1,
@@ -188,5 +197,5 @@ def test_eastmoney_list_failure_explains_initialization_stage(monkeypatch):
 
     monkeypatch.setattr(data_source, "get_realtime_quotes", unavailable)
     with pytest.raises(RuntimeError, match="尚未开始下载日线") as error:
-        data_source.get_stock_list()
+        data_source.get_stock_list("eastmoney")
     assert isinstance(error.value.__cause__, ConnectionError)

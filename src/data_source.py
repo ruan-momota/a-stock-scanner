@@ -2,7 +2,7 @@
 
 import logging
 import time
-from datetime import date, timedelta
+from datetime import date
 from functools import lru_cache
 
 import akshare as ak
@@ -20,6 +20,7 @@ QUOTE_COLUMNS = {
     "涨跌幅": "change_pct",
     "成交量": "volume",
     "成交额": "amount",
+    "今开": "open",
     "最高": "day_high",
     "最低": "day_low",
     "量比": "volume_ratio",
@@ -60,7 +61,18 @@ def request(function, **kwargs):
 
 def get_realtime_quotes() -> pd.DataFrame:
     raw = request(ak.stock_zh_a_spot_em)
-    required = {"代码", "名称", "最新价", "成交额", "量比", "最高", "最低", "换手率"}
+    required = {
+        "代码",
+        "名称",
+        "最新价",
+        "今开",
+        "最高",
+        "最低",
+        "成交量",
+        "成交额",
+        "量比",
+        "换手率",
+    }
     if raw.empty or not required.issubset(raw.columns):
         raise ValueError("实时行情为空或缺少关键字段，请稍后重试。")
     quotes = raw.rename(columns=QUOTE_COLUMNS).reindex(columns=QUOTE_COLUMNS.values())
@@ -88,7 +100,7 @@ def eligible_stocks(quotes: pd.DataFrame) -> pd.DataFrame:
     return stocks
 
 
-def get_stock_list(source: str = "eastmoney") -> pd.DataFrame:
+def get_stock_list(source: str = "sina") -> pd.DataFrame:
     if source == "sina":
         frames = []
         for function, board, code_column, name_column in (
@@ -122,7 +134,7 @@ def get_stock_list(source: str = "eastmoney") -> pd.DataFrame:
 
 
 def get_daily_history(
-    symbol: str, start: date, end: date, source: str = "eastmoney"
+    symbol: str, start: date, end: date, source: str = "sina"
 ) -> pd.DataFrame:
     dates = {"start_date": start.strftime("%Y%m%d"), "end_date": end.strftime("%Y%m%d")}
     if source == "sina":
@@ -151,6 +163,11 @@ def get_daily_history(
         return pd.DataFrame(columns=DAILY_COLUMNS.values())
     daily = raw.rename(columns=DAILY_COLUMNS)[list(DAILY_COLUMNS.values())].copy()
     daily["symbol"] = symbol
+    return clean_daily(daily)
+
+
+def clean_daily(daily: pd.DataFrame) -> pd.DataFrame:
+    daily = daily[list(DAILY_COLUMNS.values())].copy()
     daily["date"] = pd.to_datetime(daily["date"], errors="coerce")
     numeric = daily.columns.difference(["symbol", "date"])
     daily[numeric] = daily[numeric].apply(pd.to_numeric, errors="coerce")
@@ -160,6 +177,14 @@ def get_daily_history(
     valid &= daily["open"].between(daily["low"], daily["high"])
     valid &= (daily[["volume", "amount", "turnover"]] >= 0).all(axis=1)
     return daily.loc[valid].drop_duplicates(["symbol", "date"]).sort_values("date")
+
+
+def get_daily_snapshot(day: date) -> pd.DataFrame:
+    daily = get_realtime_quotes().rename(
+        columns={"price": "close", "day_high": "high", "day_low": "low"}
+    )
+    daily["date"] = pd.Timestamp(day)
+    return clean_daily(daily)
 
 
 @lru_cache(maxsize=1)
@@ -181,29 +206,66 @@ def trading_days_through(day: date) -> list[date]:
 def update_history(
     connection, end: date, *, initialize: bool = False, source: str | None = None
 ) -> dict:
-    """下载线程不访问数据库；已有股票只下载最后日期之后的数据。"""
+    """初始化历史数据，或用东财全市场快照追加一个交易日。"""
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
     from src import database
 
     state = database.load_state()
-    previous_source = state.get("history_source", "eastmoney")
+    previous_source = state.get("history_source", "sina")
     source = source or previous_source
     if source not in ("eastmoney", "sina"):
         raise ValueError(f"未知历史数据源：{source}")
-    if (
-        source != previous_source
-        and connection.execute("SELECT EXISTS(SELECT 1 FROM daily_prices)").fetchone()[
-            0
-        ]
-    ):
+    has_prices = connection.execute(
+        "SELECT EXISTS(SELECT 1 FROM daily_prices)"
+    ).fetchone()[0]
+    if source != previous_source and has_prices:
         raise ValueError(
             "数据库已有其他来源的日线，请使用独立数据目录，避免混合前复权口径。"
         )
+
+    if not initialize:
+        stocks = state.get("stocks", [])
+        if not stocks or not has_prices:
+            raise ValueError("还没有历史数据，请先运行 init。")
+        symbols = {row["symbol"] for row in stocks}
+        current = {
+            row[0]
+            for row in connection.execute(
+                "SELECT symbol FROM daily_prices WHERE date = ?", [end]
+            ).fetchall()
+        }
+        pending = symbols - current
+        if pending:
+            daily = get_daily_snapshot(end)
+            daily = daily.loc[daily.symbol.isin(pending)]
+            database.save_daily(connection, daily)
+        else:
+            daily = pd.DataFrame()
+        saved_symbols = set(daily.symbol) if not daily.empty else set()
+        failures = {
+            symbol: "全市场快照未返回有效行情"
+            for symbol in sorted(pending - saved_symbols)
+        }
+        result = {
+            "date": end.isoformat(),
+            "saved": len(saved_symbols),
+            "failed": failures,
+            "skipped": len(current & symbols),
+        }
+        database.save_state(update=result)
+        logger.info(
+            "快照更新完成：新增 %s，缺失 %s，已存在 %s",
+            result["saved"],
+            len(failures),
+            result["skipped"],
+        )
+        return result
+
     logger.info("获取股票名单，历史数据源：%s", source)
     stocks = get_stock_list(source)
     days = trading_days_through(end)
-    initial_start = days[max(0, len(days) - config.HISTORY_DAYS)]
+    start = days[max(0, len(days) - config.HISTORY_DAYS)]
     ranges = connection.execute(
         "SELECT symbol, max(date) FROM daily_prices GROUP BY symbol"
     ).fetchall()
@@ -226,17 +288,11 @@ def update_history(
 
     def download(symbol):
         try:
-            download_start = (
-                latest[symbol] + timedelta(days=1)
-                if symbol in latest
-                else initial_start
-            )
-            history = get_daily_history(symbol, download_start, end, source)
+            history = get_daily_history(symbol, start, end, source)
         finally:
             if source == "sina":
                 time.sleep(1)
-        if symbol not in latest:
-            history = history.tail(config.HISTORY_DAYS)
+        history = history.tail(config.HISTORY_DAYS)
         if history.empty:
             raise ValueError("未返回有效日线")
         return history
@@ -244,7 +300,7 @@ def update_history(
     if source == "sina":
         workers = config.SINA_DOWNLOAD_WORKERS
     else:
-        workers = config.DOWNLOAD_WORKERS if initialize else 1
+        workers = config.DOWNLOAD_WORKERS
     with ThreadPoolExecutor(max_workers=workers) as executor:
         futures = {executor.submit(download, symbol): symbol for symbol in symbols}
         for future in as_completed(futures):

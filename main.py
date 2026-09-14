@@ -14,16 +14,13 @@ logger = logging.getLogger(__name__)
 def main(argv=None):
     parser = argparse.ArgumentParser(description="A 股低位放量扫描工具")
     commands = parser.add_subparsers(dest="command", required=True)
-    for name, help_text in (
-        ("init", "首次下载最近250个交易日日线"),
-        ("update", "增量更新本地前复权日线"),
-    ):
-        command = commands.add_parser(name, help=help_text)
-        command.add_argument(
-            "--source",
-            choices=["eastmoney", "sina"],
-            help="历史数据源；默认沿用数据库记录，新数据库默认 eastmoney",
-        )
+    init = commands.add_parser("init", help="使用新浪下载最近250个交易日日线")
+    init.add_argument(
+        "--source",
+        choices=["sina", "eastmoney"],
+        help="初始化历史数据源；新数据库默认 sina，已有数据库沿用原来源",
+    )
+    commands.add_parser("update", help="使用东财全市场快照追加最新日线")
     commands.add_parser("pool", help="生成最近收盘日低位股票池")
     scan = commands.add_parser("scan", help="盘中自动扫描，Ctrl+C停止")
     scan.add_argument("--once", action="store_true", help="只扫描一次")
@@ -48,7 +45,7 @@ def main(argv=None):
                     connection,
                     day,
                     initialize=args.command == "init",
-                    source=args.source,
+                    source=args.source if args.command == "init" else None,
                 )
                 return 1 if result["failed"] else 0
             if args.command == "pool":
