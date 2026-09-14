@@ -204,10 +204,22 @@ def update_history(
     stocks = get_stock_list(source)
     days = trading_days_through(end)
     start = days[max(0, len(days) - config.HISTORY_DAYS)]
-    earliest = dict(
-        connection.execute(
-            "SELECT symbol, min(date) FROM daily_prices GROUP BY symbol"
-        ).fetchall()
+    ranges = connection.execute(
+        "SELECT symbol, min(date), max(date) FROM daily_prices GROUP BY symbol"
+    ).fetchall()
+    earliest = {symbol: first for symbol, first, _ in ranges}
+    latest = {symbol: last for symbol, _, last in ranges}
+    symbols = [
+        symbol
+        for symbol in stocks.symbol
+        if symbol not in latest or latest[symbol] < end
+    ]
+    skipped = len(stocks) - len(symbols)
+    logger.info(
+        "目标股票 %s，只需下载 %s，已跳过 %s",
+        len(stocks),
+        len(symbols),
+        skipped,
     )
     database.save_state(stocks=stocks.to_dict("records"), history_source=source)
     failures = {}
@@ -227,11 +239,12 @@ def update_history(
             raise ValueError("未返回有效日线")
         return history
 
-    workers = config.DOWNLOAD_WORKERS if initialize and source == "eastmoney" else 1
+    if source == "sina":
+        workers = config.SINA_DOWNLOAD_WORKERS
+    else:
+        workers = config.DOWNLOAD_WORKERS if initialize else 1
     with ThreadPoolExecutor(max_workers=workers) as executor:
-        futures = {
-            executor.submit(download, symbol): symbol for symbol in stocks.symbol
-        }
+        futures = {executor.submit(download, symbol): symbol for symbol in symbols}
         for future in as_completed(futures):
             symbol = futures[future]
             try:
@@ -243,10 +256,20 @@ def update_history(
             database.save_daily(connection, history)
             saved += 1
             if saved % 100 == 0:
-                logger.info("已保存 %s/%s 只股票日线", saved, len(stocks))
-    result = {"date": end.isoformat(), "saved": saved, "failed": failures}
+                logger.info("已保存 %s/%s 只股票日线", saved, len(symbols))
+    result = {
+        "date": end.isoformat(),
+        "saved": saved,
+        "failed": failures,
+        "skipped": skipped,
+    }
     database.save_state(update=result)
-    logger.info("日线更新完成：成功 %s，失败 %s", saved, len(failures))
-    if not saved:
+    logger.info(
+        "日线更新完成：成功 %s，失败 %s，跳过 %s",
+        saved,
+        len(failures),
+        skipped,
+    )
+    if symbols and not saved:
         raise ValueError("本轮没有成功下载日线，请检查行情接口后重试。")
     return result

@@ -63,7 +63,7 @@ def connect():
 
 def load_state() -> dict:
     path = config.DB_PATH.with_suffix(".json")
-    return json.loads(path.read_text()) if path.exists() else {}
+    return json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
 
 
 def save_state(**changes):
@@ -71,7 +71,9 @@ def save_state(**changes):
     state.update(changes)
     path = config.DB_PATH.with_suffix(".json")
     temporary = path.with_suffix(".tmp")
-    temporary.write_text(json.dumps(state, ensure_ascii=False, indent=2, default=str))
+    temporary.write_text(
+        json.dumps(state, ensure_ascii=False, indent=2, default=str), encoding="utf-8"
+    )
     temporary.replace(path)
 
 

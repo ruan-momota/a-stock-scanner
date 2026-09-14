@@ -1,4 +1,4 @@
-from datetime import date
+from datetime import date, timedelta
 
 import pandas as pd
 import pytest
@@ -128,6 +128,56 @@ def test_source_is_persisted_reused_and_cannot_mix_prices(tmp_path, monkeypatch)
             data_source.update_history(connection, day, source="eastmoney")
     assert database.load_state()["history_source"] == "sina"
     assert sources == ["sina", "sina"]
+
+
+def test_update_skips_current_and_downloads_lagging(tmp_path, monkeypatch):
+    monkeypatch.setattr(config, "DB_PATH", tmp_path / "market.duckdb")
+    day = date(2026, 9, 11)
+    previous = day - timedelta(days=1)
+    stocks = pd.DataFrame(
+        [
+            {"symbol": "600000", "name": "已完成", "market": "沪市主板"},
+            {"symbol": "000001", "name": "待更新", "market": "深市主板"},
+        ]
+    )
+    monkeypatch.setattr(data_source, "get_stock_list", lambda source: stocks)
+    monkeypatch.setattr(data_source, "get_trading_days", lambda: (previous, day))
+    monkeypatch.setattr(data_source.time, "sleep", lambda _: None)
+    calls = []
+
+    def row(symbol, row_day):
+        return pd.DataFrame(
+            {
+                "symbol": [symbol],
+                "date": [row_day],
+                "open": [10.0],
+                "high": [12.0],
+                "low": [9.0],
+                "close": [11.0],
+                "volume": [100.0],
+                "amount": [110000.0],
+                "turnover": [2.5],
+            }
+        )
+
+    def download(symbol, start, end, source):
+        calls.append((symbol, start, end, source))
+        return row(symbol, end)
+
+    monkeypatch.setattr(data_source, "get_daily_history", download)
+    with database.connect() as connection:
+        database.save_daily(connection, row("600000", day))
+        database.save_daily(connection, row("000001", previous))
+        database.save_state(history_source="sina")
+        result = data_source.update_history(connection, day)
+
+    assert calls == [("000001", previous, day, "sina")]
+    assert result == {
+        "date": day.isoformat(),
+        "saved": 1,
+        "failed": {},
+        "skipped": 1,
+    }
 
 
 def test_eastmoney_list_failure_explains_initialization_stage(monkeypatch):

@@ -33,6 +33,7 @@ def test_workflow(tmp_path, monkeypatch):
     monkeypatch.setattr(data_source, "get_daily_history", download)
     assert main(["init"]) == 0
     assert main(["update"]) == 0
+    assert len(downloads) == 1
     assert downloads[-1][1] == daily.date.iloc[0].date()
     assert main(["pool"]) == 0
     assert main(["backtest"]) == 0
