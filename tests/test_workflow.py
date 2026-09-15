@@ -55,7 +55,7 @@ def test_workflow(tmp_path, monkeypatch):
     )
     calls = []
 
-    def realtime():
+    def realtime(*_):
         calls.append(1)
         return quotes.copy()
 
@@ -70,7 +70,7 @@ def test_workflow(tmp_path, monkeypatch):
         assert scanner.scan_once(connection, now.replace(hour=12))[0] == metadata
         assert len(calls) == 1
 
-        def unavailable():
+        def unavailable(*_):
             raise ConnectionError("行情接口不可用")
 
         monkeypatch.setattr(data_source, "get_realtime_quotes", unavailable)
@@ -99,7 +99,7 @@ def test_page_manual_does_not_request_quotes(tmp_path, monkeypatch):
 
     monkeypatch.setattr(config, "DB_PATH", tmp_path / "market.duckdb")
 
-    def forbidden():
+    def forbidden(*_):
         raise AssertionError("手动打开页面不应请求行情")
 
     monkeypatch.setattr(data_source, "get_realtime_quotes", forbidden)

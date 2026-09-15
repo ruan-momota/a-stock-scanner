@@ -1,33 +1,33 @@
-"""只获取和整理 AKShare 数据，不包含选股规则。"""
+"""获取和整理行情数据，不包含选股规则。"""
 
+import csv
 import logging
+import re
 import time
-from datetime import date
+from datetime import date, datetime
 from functools import lru_cache
 
 import akshare as ak
 import numpy as np
 import pandas as pd
+import requests
 
 from src import config
 
 logger = logging.getLogger(__name__)
 
-QUOTE_COLUMNS = {
-    "代码": "symbol",
-    "名称": "name",
-    "最新价": "price",
-    "涨跌幅": "change_pct",
-    "成交量": "volume",
-    "成交额": "amount",
-    "最高": "day_high",
-    "最低": "day_low",
-    "量比": "volume_ratio",
-    "换手率": "turnover",
-    "总市值": "market_cap",
-    "流通市值": "float_market_cap",
-    "5分钟涨跌": "change_5m",
-}
+REALTIME_COLUMNS = [
+    "symbol",
+    "name",
+    "price",
+    "change_pct",
+    "volume",
+    "amount",
+    "day_high",
+    "day_low",
+    "volume_ratio",
+    "turnover",
+]
 DAILY_COLUMNS = {
     "股票代码": "symbol",
     "日期": "date",
@@ -38,6 +38,11 @@ DAILY_COLUMNS = {
     "成交量": "volume",
     "成交额": "amount",
     "换手率": "turnover",
+}
+SINA_QUOTE_URL = "https://hq.sinajs.cn/"
+SINA_QUOTE_HEADERS = {
+    "Referer": "https://finance.sina.com.cn/",
+    "User-Agent": "Mozilla/5.0",
 }
 
 
@@ -58,16 +63,97 @@ def request(function, **kwargs):
             time.sleep(1)
 
 
-def get_realtime_quotes() -> pd.DataFrame:
-    raw = request(ak.stock_zh_a_spot_em)
-    required = {"代码", "名称", "最新价", "成交额", "量比", "最高", "最低", "换手率"}
-    if raw.empty or not required.issubset(raw.columns):
-        raise ValueError("实时行情为空或缺少关键字段，请稍后重试。")
-    quotes = raw.rename(columns=QUOTE_COLUMNS).reindex(columns=QUOTE_COLUMNS.values())
-    quotes["symbol"] = quotes["symbol"].astype(str).str.zfill(6)
-    for column in quotes.columns.difference(["symbol", "name"]):
-        quotes[column] = pd.to_numeric(quotes[column], errors="coerce")
-    logger.info("获取实时行情成功，共 %s 只", len(quotes))
+def _parse_sina_quotes(text: str) -> pd.DataFrame:
+    rows = []
+    for code, payload in re.findall(r'var hq_str_(\w+)="(.*?)";', text):
+        values = next(csv.reader([payload]))
+        if len(values) < 32 or not values[0]:
+            continue
+        rows.append(
+            {
+                "symbol": code[-6:],
+                "name": values[0],
+                "previous_close": values[2],
+                "price": values[3],
+                "day_high": values[4],
+                "day_low": values[5],
+                "volume": values[8],
+                "amount": values[9],
+                "quote_date": values[30],
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def _get_sina_quote_batch(symbols: list[str]) -> pd.DataFrame:
+    codes = [("sh" if symbol.startswith("6") else "sz") + symbol for symbol in symbols]
+
+    def download():
+        response = requests.get(
+            f"{SINA_QUOTE_URL}?list={','.join(codes)}",
+            headers=SINA_QUOTE_HEADERS,
+            timeout=config.REQUEST_TIMEOUT_SECONDS,
+        )
+        response.raise_for_status()
+        return response.content.decode("gb18030", errors="replace")
+
+    quotes = _parse_sina_quotes(request(download))
+    if quotes.empty:
+        raise ValueError("新浪本批实时行情为空，请稍后重试。")
+    return quotes
+
+
+def _trading_fraction(now: datetime) -> float:
+    minutes = now.hour * 60 + now.minute + now.second / 60
+    morning = min(max(minutes - 570, 0), 120)
+    afternoon = min(max(minutes - 780, 0), 120)
+    return max((morning + afternoon) / 240, 1 / 240)
+
+
+def get_realtime_quotes(
+    symbols: list[str], baselines: pd.DataFrame, now: datetime
+) -> pd.DataFrame:
+    """只获取股票池的新浪报价，并补充盘中估算指标。"""
+    symbols = list(dict.fromkeys(str(symbol).zfill(6) for symbol in symbols))
+    if not symbols:
+        return pd.DataFrame(columns=REALTIME_COLUMNS)
+    frames = [
+        _get_sina_quote_batch(symbols[index : index + config.SINA_QUOTE_BATCH_SIZE])
+        for index in range(0, len(symbols), config.SINA_QUOTE_BATCH_SIZE)
+    ]
+    quotes = pd.concat(frames, ignore_index=True)
+    if quotes.empty:
+        raise ValueError("新浪实时行情为空，请稍后重试。")
+    quote_days = pd.to_datetime(quotes["quote_date"], errors="coerce").dt.date
+    quotes = quotes.loc[quote_days == now.date()].copy()
+    if quotes.empty:
+        raise ValueError("新浪未返回当天实时行情，请稍后重试。")
+    numeric = [
+        "previous_close",
+        "price",
+        "day_high",
+        "day_low",
+        "volume",
+        "amount",
+    ]
+    quotes[numeric] = quotes[numeric].apply(pd.to_numeric, errors="coerce")
+    quotes["volume"] /= 100
+    quotes["change_pct"] = (
+        quotes["price"] / quotes["previous_close"].where(quotes.previous_close > 0) - 1
+    ) * 100
+    quotes = quotes.merge(baselines, on="symbol", how="left")
+    quotes["volume_ratio"] = quotes["volume"] / (
+        quotes["avg_volume_20"].where(quotes.avg_volume_20 > 0) * _trading_fraction(now)
+    )
+    quotes["turnover"] = quotes["volume"] / quotes["volume_per_turnover"].where(
+        quotes.volume_per_turnover > 0
+    )
+    quotes = quotes.reindex(columns=REALTIME_COLUMNS)
+    logger.info(
+        "新浪批量行情获取成功，请求股票池 %s 只，返回 %s 只",
+        len(symbols),
+        len(quotes),
+    )
     return quotes.drop_duplicates("symbol")
 
 
@@ -108,7 +194,13 @@ def get_stock_list(source: str = "sina") -> pd.DataFrame:
         stocks["symbol"] = stocks["symbol"].astype(str).str.zfill(6)
     elif source == "eastmoney":
         try:
-            stocks = get_realtime_quotes()
+            raw = request(ak.stock_zh_a_spot_em)
+            if raw.empty or not {"代码", "名称"}.issubset(raw.columns):
+                raise ValueError("股票名单为空或缺少代码、名称。")
+            stocks = raw.rename(columns={"代码": "symbol", "名称": "name"})[
+                ["symbol", "name"]
+            ]
+            stocks["symbol"] = stocks["symbol"].astype(str).str.zfill(6)
         except Exception as exc:
             raise RuntimeError(
                 "东方财富股票名单获取失败，尚未开始下载日线。"

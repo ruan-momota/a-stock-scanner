@@ -113,6 +113,35 @@ def load_pool(connection, day: date | str | None = None) -> pd.DataFrame:
     ).df()
 
 
+def load_quote_baselines(connection, symbols: list[str], day: date) -> pd.DataFrame:
+    """读取新浪盘中指标需要的本地成交量基线。"""
+    if not symbols:
+        return pd.DataFrame(columns=["symbol", "avg_volume_20", "volume_per_turnover"])
+    selected = pd.DataFrame({"symbol": symbols})
+    with connection.cursor() as cursor:
+        cursor.register("selected_symbols", selected)
+        return cursor.execute(
+            """WITH ranked AS (
+                   SELECT d.symbol, d.volume, d.turnover,
+                          row_number() OVER (
+                              PARTITION BY d.symbol ORDER BY d.date DESC
+                          ) AS recency
+                   FROM daily_prices d
+                   JOIN selected_symbols s USING (symbol)
+                   WHERE d.date <= ?
+               )
+               SELECT symbol,
+                      avg(volume) FILTER (WHERE recency <= 20) AS avg_volume_20,
+                      median(volume / turnover) FILTER (
+                          WHERE recency <= 120 AND turnover > 0
+                      ) AS volume_per_turnover
+               FROM ranked
+               WHERE recency <= 120
+               GROUP BY symbol""",
+            [day],
+        ).df()
+
+
 def save_scan(
     connection,
     candidates: pd.DataFrame,

@@ -68,7 +68,11 @@ def scan_once(connection, now: datetime | None = None):
     if pool.empty:
         candidates = database.load_latest_scan(connection)[1].iloc[:0]
     else:
-        realtime = data_source.eligible_stocks(data_source.get_realtime_quotes())
+        symbols = pool.symbol.tolist()
+        baselines = database.load_quote_baselines(connection, symbols, pool_date)
+        realtime = data_source.eligible_stocks(
+            data_source.get_realtime_quotes(symbols, baselines, now)
+        )
         candidates = realtime.merge(pool.drop(columns="name"), on="symbol", how="inner")
         candidates = candidates.loc[
             (candidates["amount"] >= config.MIN_AMOUNT)

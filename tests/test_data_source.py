@@ -42,6 +42,70 @@ def test_exchange_list_filters_scope_and_rejects_partial_lists(monkeypatch):
         data_source.get_stock_list("sina")
 
 
+def test_sina_pool_quotes_are_batched_and_metrics_are_estimated(monkeypatch):
+    calls = []
+
+    def batch(symbols):
+        calls.append(symbols)
+        return pd.DataFrame(
+            {
+                "symbol": symbols,
+                "name": ["浦发银行"] * len(symbols),
+                "previous_close": [10.0] * len(symbols),
+                "price": [11.0] * len(symbols),
+                "day_high": [12.0] * len(symbols),
+                "day_low": [9.0] * len(symbols),
+                "volume": [5000.0] * len(symbols),
+                "amount": [100_000_000.0] * len(symbols),
+                "quote_date": ["2026-09-15"] * len(symbols),
+            }
+        )
+
+    monkeypatch.setattr(config, "SINA_QUOTE_BATCH_SIZE", 1)
+    monkeypatch.setattr(data_source, "_get_sina_quote_batch", batch)
+    baselines = pd.DataFrame(
+        {
+            "symbol": ["600000", "000001"],
+            "avg_volume_20": [100.0, 100.0],
+            "volume_per_turnover": [50.0, 50.0],
+        }
+    )
+    now = pd.Timestamp("2026-09-15 10:30:00", tz=config.TIMEZONE).to_pydatetime()
+    quotes = data_source.get_realtime_quotes(["600000", "000001"], baselines, now)
+    assert calls == [["600000"], ["000001"]]
+    assert quotes.volume.tolist() == [50.0, 50.0]
+    assert quotes.volume_ratio.tolist() == [2.0, 2.0]
+    assert quotes.turnover.tolist() == [1.0, 1.0]
+    assert quotes.change_pct.tolist() == pytest.approx([10.0, 10.0])
+
+
+def test_sina_quote_request_keeps_batch_separator_and_parses_response(monkeypatch):
+    payload = (
+        'var hq_str_sh600000="浦发银行,10,10,11,12,9,0,0,5000,100000,'
+        "0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,"
+        '2026-09-15,10:30:00,00";\n'
+    ).encode("gb18030")
+    urls = []
+
+    class Response:
+        content = payload
+
+        @staticmethod
+        def raise_for_status():
+            return None
+
+    def get(url, **_):
+        urls.append(url)
+        return Response()
+
+    monkeypatch.setattr(data_source.requests, "get", get)
+    quotes = data_source._get_sina_quote_batch(["600000", "000001"])
+    assert urls == [f"{data_source.SINA_QUOTE_URL}?list=sh600000,sz000001"]
+    assert quotes.iloc[0].symbol == "600000"
+    assert quotes.iloc[0]["name"] == "浦发银行"
+    assert quotes.iloc[0].price == "11"
+
+
 @pytest.mark.parametrize(
     "symbol,prefix",
     [("600000", "sh"), ("000001", "sz"), ("300001", "sz"), ("688001", "sh")],
@@ -196,7 +260,7 @@ def test_eastmoney_list_failure_explains_initialization_stage(monkeypatch):
     def unavailable():
         raise ConnectionError("remote closed")
 
-    monkeypatch.setattr(data_source, "get_realtime_quotes", unavailable)
+    monkeypatch.setattr(data_source.ak, "stock_zh_a_spot_em", unavailable)
     with pytest.raises(RuntimeError, match="尚未开始下载日线") as error:
         data_source.get_stock_list("eastmoney")
     assert isinstance(error.value.__cause__, ConnectionError)
